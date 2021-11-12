@@ -74,25 +74,6 @@ type Entry struct {
 // Valid returns true if this is not the zero entry.
 func (e Entry) Valid() bool { return e.ID != 0 }
 
-// byTime is a wrapper for sorting the entry array by time
-// (with zero time at the end).
-type byTime []*Entry
-
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s byTime) Less(i, j int) bool {
-	// Two zero times should return false.
-	// Otherwise, zero is "greater" than any other time.
-	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
-		return false
-	}
-	if s[j].Next.IsZero() {
-		return true
-	}
-	return s[i].Next.Before(s[j].Next)
-}
-
 // New returns a new Cron job runner, modified by the given options.
 //
 // Available Settings
@@ -253,9 +234,6 @@ func (c *Cron) run() {
 
 	for {
 		// Determine the next entry to run.
-		// User min-heap no need sort anymore
-		//sort.Sort(byTime(c.entries))
-
 		var timer *time.Timer
 		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
@@ -263,7 +241,6 @@ func (c *Cron) run() {
 			timer = time.NewTimer(100000 * time.Hour)
 		} else {
 			timer = time.NewTimer(c.entries[0].Next.Sub(now))
-			//fmt.Printf(" %v, %+v\n", c.entries[0].Next.Sub(now), c.entries[0].ID)
 		}
 
 		for {
