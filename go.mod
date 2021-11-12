@@ -1,3 +1,3 @@
-module github.com/tovenja/cron/v3
+module github.com/seedcx/go-cron/v3
 
 go 1.12
