@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"sync"
@@ -37,7 +38,7 @@ func (c Chain) Then(j Job) Job {
 // Recover panics in wrapped jobs and log them with the provided logger.
 func Recover(logger Logger) JobWrapper {
 	return func(j Job) Job {
-		return FuncJob(func() {
+		return FuncContextJob(func(ctx context.Context) {
 			defer func() {
 				if r := recover(); r != nil {
 					const size = 64 << 10
@@ -50,7 +51,7 @@ func Recover(logger Logger) JobWrapper {
 					logger.Error(err, "panic", "stack", "...\n"+string(buf))
 				}
 			}()
-			j.Run()
+			j.Run(ctx)
 		})
 	}
 }
@@ -61,14 +62,14 @@ func Recover(logger Logger) JobWrapper {
 func DelayIfStillRunning(logger Logger) JobWrapper {
 	return func(j Job) Job {
 		var mu sync.Mutex
-		return FuncJob(func() {
+		return FuncContextJob(func(ctx context.Context) {
 			start := time.Now()
 			mu.Lock()
 			defer mu.Unlock()
 			if dur := time.Since(start); dur > time.Minute {
 				logger.Info("delay", "duration", dur)
 			}
-			j.Run()
+			j.Run(ctx)
 		})
 	}
 }
@@ -79,11 +80,11 @@ func SkipIfStillRunning(logger Logger) JobWrapper {
 	return func(j Job) Job {
 		var ch = make(chan struct{}, 1)
 		ch <- struct{}{}
-		return FuncJob(func() {
+		return FuncContextJob(func(ctx context.Context) {
 			select {
 			case v := <-ch:
 				defer func() { ch <- v }()
-				j.Run()
+				j.Run(ctx)
 			default:
 				logger.Info("skip")
 			}

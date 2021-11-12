@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"context"
 	"io/ioutil"
 	"log"
 	"reflect"
@@ -20,9 +21,9 @@ func appendingJob(slice *[]int, value int) Job {
 
 func appendingWrapper(slice *[]int, value int) JobWrapper {
 	return func(j Job) Job {
-		return FuncJob(func() {
-			appendingJob(slice, value).Run()
-			j.Run()
+		return FuncContextJob(func(ctx context.Context) {
+			appendingJob(slice, value).Run(ctx)
+			j.Run(ctx)
 		})
 	}
 }
@@ -35,7 +36,7 @@ func TestChain(t *testing.T) {
 		append3 = appendingWrapper(&nums, 3)
 		append4 = appendingJob(&nums, 4)
 	)
-	NewChain(append1, append2, append3).Then(append4).Run()
+	NewChain(append1, append2, append3).Then(append4).Run(context.Background())
 	if !reflect.DeepEqual(nums, []int{1, 2, 3, 4}) {
 		t.Error("unexpected order of calls:", nums)
 	}
@@ -53,19 +54,19 @@ func TestChainRecover(t *testing.T) {
 			}
 		}()
 		NewChain().Then(panickingJob).
-			Run()
+			Run(context.Background())
 	})
 
 	t.Run("Recovering JobWrapper recovers", func(t *testing.T) {
 		NewChain(Recover(PrintfLogger(log.New(ioutil.Discard, "", 0)))).
 			Then(panickingJob).
-			Run()
+			Run(context.Background())
 	})
 
 	t.Run("composed with the *IfStillRunning wrappers", func(t *testing.T) {
 		NewChain(Recover(PrintfLogger(log.New(ioutil.Discard, "", 0)))).
 			Then(panickingJob).
-			Run()
+			Run(context.Background())
 	})
 }
 
@@ -76,7 +77,7 @@ type countJob struct {
 	delay   time.Duration
 }
 
-func (j *countJob) Run() {
+func (j *countJob) Run(_ context.Context) {
 	j.m.Lock()
 	j.started++
 	j.m.Unlock()
@@ -99,11 +100,10 @@ func (j *countJob) Done() int {
 }
 
 func TestChainDelayIfStillRunning(t *testing.T) {
-
 	t.Run("runs immediately", func(t *testing.T) {
 		var j countJob
 		wrappedJob := NewChain(DelayIfStillRunning(DiscardLogger)).Then(&j)
-		go wrappedJob.Run()
+		go wrappedJob.Run(context.Background())
 		time.Sleep(2 * time.Millisecond) // Give the job 2ms to complete.
 		if c := j.Done(); c != 1 {
 			t.Errorf("expected job run once, immediately, got %d", c)
@@ -111,12 +111,15 @@ func TestChainDelayIfStillRunning(t *testing.T) {
 	})
 
 	t.Run("second run immediate if first done", func(t *testing.T) {
-		var j countJob
-		wrappedJob := NewChain(DelayIfStillRunning(DiscardLogger)).Then(&j)
+		var (
+			j          countJob
+			wrappedJob = NewChain(DelayIfStillRunning(DiscardLogger)).Then(&j)
+			ctx        = context.Background()
+		)
 		go func() {
-			go wrappedJob.Run()
+			go wrappedJob.Run(ctx)
 			time.Sleep(time.Millisecond)
-			go wrappedJob.Run()
+			go wrappedJob.Run(ctx)
 		}()
 		time.Sleep(3 * time.Millisecond) // Give both jobs 3ms to complete.
 		if c := j.Done(); c != 2 {
@@ -125,13 +128,16 @@ func TestChainDelayIfStillRunning(t *testing.T) {
 	})
 
 	t.Run("second run delayed if first not done", func(t *testing.T) {
-		var j countJob
+		var (
+			j   countJob
+			ctx = context.Background()
+		)
 		j.delay = 10 * time.Millisecond
 		wrappedJob := NewChain(DelayIfStillRunning(DiscardLogger)).Then(&j)
 		go func() {
-			go wrappedJob.Run()
+			go wrappedJob.Run(ctx)
 			time.Sleep(time.Millisecond)
-			go wrappedJob.Run()
+			go wrappedJob.Run(ctx)
 		}()
 
 		// After 5ms, the first job is still in progress, and the second job was
@@ -149,15 +155,13 @@ func TestChainDelayIfStillRunning(t *testing.T) {
 			t.Error("expected both jobs done, got", started, done)
 		}
 	})
-
 }
 
 func TestChainSkipIfStillRunning(t *testing.T) {
-
 	t.Run("runs immediately", func(t *testing.T) {
 		var j countJob
 		wrappedJob := NewChain(SkipIfStillRunning(DiscardLogger)).Then(&j)
-		go wrappedJob.Run()
+		go wrappedJob.Run(context.Background())
 		time.Sleep(2 * time.Millisecond) // Give the job 2ms to complete.
 		if c := j.Done(); c != 1 {
 			t.Errorf("expected job run once, immediately, got %d", c)
@@ -165,12 +169,15 @@ func TestChainSkipIfStillRunning(t *testing.T) {
 	})
 
 	t.Run("second run immediate if first done", func(t *testing.T) {
-		var j countJob
-		wrappedJob := NewChain(SkipIfStillRunning(DiscardLogger)).Then(&j)
+		var (
+			j          countJob
+			wrappedJob = NewChain(SkipIfStillRunning(DiscardLogger)).Then(&j)
+			ctx        = context.Background()
+		)
 		go func() {
-			go wrappedJob.Run()
+			go wrappedJob.Run(ctx)
 			time.Sleep(time.Millisecond)
-			go wrappedJob.Run()
+			go wrappedJob.Run(ctx)
 		}()
 		time.Sleep(3 * time.Millisecond) // Give both jobs 3ms to complete.
 		if c := j.Done(); c != 2 {
@@ -179,13 +186,16 @@ func TestChainSkipIfStillRunning(t *testing.T) {
 	})
 
 	t.Run("second run skipped if first not done", func(t *testing.T) {
-		var j countJob
+		var (
+			j   countJob
+			ctx = context.Background()
+		)
 		j.delay = 10 * time.Millisecond
 		wrappedJob := NewChain(SkipIfStillRunning(DiscardLogger)).Then(&j)
 		go func() {
-			go wrappedJob.Run()
+			go wrappedJob.Run(ctx)
 			time.Sleep(time.Millisecond)
-			go wrappedJob.Run()
+			go wrappedJob.Run(ctx)
 		}()
 
 		// After 5ms, the first job is still in progress, and the second job was
@@ -209,7 +219,7 @@ func TestChainSkipIfStillRunning(t *testing.T) {
 		j.delay = 10 * time.Millisecond
 		wrappedJob := NewChain(SkipIfStillRunning(DiscardLogger)).Then(&j)
 		for i := 0; i < 11; i++ {
-			go wrappedJob.Run()
+			go wrappedJob.Run(context.Background())
 		}
 		time.Sleep(200 * time.Millisecond)
 		done := j.Done()
@@ -225,9 +235,11 @@ func TestChainSkipIfStillRunning(t *testing.T) {
 		chain := NewChain(SkipIfStillRunning(DiscardLogger))
 		wrappedJob1 := chain.Then(&j1)
 		wrappedJob2 := chain.Then(&j2)
+		ctx := context.Background()
+
 		for i := 0; i < 11; i++ {
-			go wrappedJob1.Run()
-			go wrappedJob2.Run()
+			go wrappedJob1.Run(ctx)
+			go wrappedJob2.Run(ctx)
 		}
 		time.Sleep(100 * time.Millisecond)
 		var (
@@ -238,5 +250,4 @@ func TestChainSkipIfStillRunning(t *testing.T) {
 			t.Error("expected both jobs executed once, got", done1, "and", done2)
 		}
 	})
-
 }

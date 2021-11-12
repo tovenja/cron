@@ -43,3 +43,10 @@ func WithLogger(logger Logger) Option {
 		c.logger = logger
 	}
 }
+
+// WithWaitGroup uses the provided WaitGroup for job waiting.
+func WithWaitGroup(wg WaitGroup) Option {
+	return func(c *Cron) {
+		c.waiter = wg
+	}
+}

@@ -23,7 +23,14 @@ type Cron struct {
 	location  *time.Location
 	parser    ScheduleParser
 	nextID    EntryID
-	jobWaiter sync.WaitGroup
+	waiter    WaitGroup
+}
+
+// WaitGroup describes a sync.WaitGroup compatible object.
+type WaitGroup interface {
+	Add(int)
+	Done()
+	Wait()
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -33,7 +40,7 @@ type ScheduleParser interface {
 
 // Job is an interface for submitted cron jobs.
 type Job interface {
-	Run()
+	Run(context.Context)
 }
 
 // Schedule describes a job's duty cycle.
@@ -76,19 +83,27 @@ func (e Entry) Valid() bool { return e.ID != 0 }
 
 // New returns a new Cron job runner, modified by the given options.
 //
-// Available Settings
+// Available Options:
 //
-//   Time Zone
+//   WithLocation
 //     Description: The time zone in which schedules are interpreted
 //     Default:     time.Local
 //
-//   Parser
+//   WithParser
 //     Description: Parser converts cron spec strings into cron.Schedules.
 //     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
+//   WithChain
 //     Description: Wrap submitted jobs to customize behavior.
 //     Default:     A chain that recovers panics and logs them to stderr.
+//
+//   WithLogger
+//     Description: Makes it use a user supplied Logger.
+//     Default:     DefaultLogger
+//
+//   WithWaiter
+//     Description: Makes it use a user supplied Waiter for job waiting.
+//     Default:     new(sync.WaitGroup)
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -104,6 +119,7 @@ func New(opts ...Option) *Cron {
 		logger:    DefaultLogger,
 		location:  time.Local,
 		parser:    standardParser,
+		waiter:    new(sync.WaitGroup),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -114,13 +130,25 @@ func New(opts ...Option) *Cron {
 // FuncJob is a wrapper that turns a func() into a cron.Job
 type FuncJob func()
 
-func (f FuncJob) Run() { f() }
+func (f FuncJob) Run(_ context.Context) { f() }
+
+// FuncJob is a wrapper that turns a func() into a cron.Job
+type FuncContextJob func(context.Context)
+
+func (f FuncContextJob) Run(ctx context.Context) { f(ctx) }
 
 // AddFunc adds a func to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
-	return c.AddJob(spec, FuncJob(cmd))
+func (c *Cron) AddFunc(spec string, fn func()) (EntryID, error) {
+	return c.AddJob(spec, FuncJob(fn))
+}
+
+// AddFuncContext adds a func to the Cron to be run on the given schedule.
+// The spec is parsed using the time zone of this Cron instance as the default.
+// An opaque ID is returned that can be used to later remove it.
+func (c *Cron) AddFuncContext(spec string, fn func(ctx context.Context)) (EntryID, error) {
+	return c.AddJob(spec, FuncContextJob(fn))
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
@@ -194,43 +222,57 @@ func (c *Cron) Remove(id EntryID) {
 }
 
 // Start the cron scheduler in its own goroutine, or no-op if already started.
-func (c *Cron) Start() {
+func (c *Cron) Start(ctx context.Context) {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
+
 	if c.running {
 		return
 	}
 	c.running = true
-	go c.run()
+
+	c.waiter.Add(1)
+
+	go func() {
+		defer c.waiter.Done()
+		c.run(ctx)
+	}()
 }
 
 // Run the cron scheduler, or no-op if already running.
-func (c *Cron) Run() {
+func (c *Cron) Run(ctx context.Context) {
 	c.runningMu.Lock()
+
 	if c.running {
 		c.runningMu.Unlock()
 		return
 	}
 	c.running = true
+
 	c.runningMu.Unlock()
-	c.run()
+
+	c.run(ctx)
 }
 
 // run the scheduler.. this is private just due to the need to synchronize
 // access to the 'running' state variable.
-func (c *Cron) run() {
+func (c *Cron) run(ctx context.Context) {
 	c.logger.Info("start")
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// Figure out the next activation times for each entry.
 	now := c.now()
-	sortedEntries := new(EntryHeap)
-	for len(c.entries) > 0 {
-		entry := heap.Pop(&c.entries).(*Entry)
+	sortedEntries := make(EntryHeap, 0, len(c.entries))
+
+	for _, entry := range c.entries {
 		entry.Next = entry.Schedule.Next(now)
-		heap.Push(sortedEntries, entry)
+		heap.Push(&sortedEntries, entry)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
-	c.entries = *sortedEntries
+
+	c.entries = sortedEntries
 
 	for {
 		// Determine the next entry to run.
@@ -245,6 +287,11 @@ func (c *Cron) run() {
 
 		for {
 			select {
+			case <-ctx.Done():
+				timer.Stop()
+				c.logger.Info("cancel")
+				return
+
 			case now = <-timer.C:
 				now = now.In(c.location)
 				c.logger.Info("wake", "now", now)
@@ -255,7 +302,7 @@ func (c *Cron) run() {
 						break
 					}
 					e = heap.Pop(&c.entries).(*Entry)
-					c.startJob(e.WrappedJob)
+					c.startJob(ctx, e.WrappedJob)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
 					heap.Push(&c.entries, e)
@@ -274,6 +321,7 @@ func (c *Cron) run() {
 				continue
 
 			case <-c.stop:
+				cancel()
 				timer.Stop()
 				c.logger.Info("stop")
 				return
@@ -291,11 +339,11 @@ func (c *Cron) run() {
 }
 
 // startJob runs the given job in a new goroutine.
-func (c *Cron) startJob(j Job) {
-	c.jobWaiter.Add(1)
+func (c *Cron) startJob(ctx context.Context, j Job) {
+	c.waiter.Add(1)
 	go func() {
-		defer c.jobWaiter.Done()
-		j.Run()
+		defer c.waiter.Done()
+		j.Run(ctx)
 	}()
 }
 
@@ -315,7 +363,7 @@ func (c *Cron) Stop() context.Context {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		c.jobWaiter.Wait()
+		c.waiter.Wait()
 		cancel()
 	}()
 	return ctx
@@ -323,7 +371,7 @@ func (c *Cron) Stop() context.Context {
 
 // entrySnapshot returns a copy of the current cron entry list.
 func (c *Cron) entrySnapshot() []Entry {
-	var entries = make([]Entry, len(c.entries))
+	entries := make([]Entry, len(c.entries))
 	for i, e := range c.entries {
 		entries[i] = *e
 	}
